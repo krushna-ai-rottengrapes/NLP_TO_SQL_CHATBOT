@@ -1,0 +1,74 @@
+@import "tailwindcss";
+
+:root {
+  --background: #ffffff;
+  --foreground: #171717;
+  --border: #e5e7eb;
+  --muted: #f3f4f6;
+  --accent: #0066cc;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+html.dark {
+  --background: #0f1419;
+  --foreground: #e8eaed;
+  --border: #2d333b;
+  --muted: #1a1f26;
+  --accent: #4da6ff;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  transition: background-color 0.3s, color 0.3s;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+html.dark ::-webkit-scrollbar-thumb {
+  background: #475569;
+}
+
+html.dark ::-webkit-scrollbar-thumb:hover {
+  background: #64748b;
+}
+
+.hljs {
+  background: transparent !important;
+  padding: 0 !important;
+}
+
+.hljs-string { color: #22863a; }
+.hljs-number { color: #005cc5; }
+.hljs-literal { color: #005cc5; }
+.hljs-attr { color: #6f42c1; }
+.hljs-keyword { color: #d73a49; }
+
+html.dark .hljs-string { color: #85e89d; }
+html.dark .hljs-number { color: #79b8ff; }
+html.dark .hljs-literal { color: #79b8ff; }
+html.dark .hljs-attr { color: #b392f0; }
+html.dark .hljs-keyword { color: #f97583; }
