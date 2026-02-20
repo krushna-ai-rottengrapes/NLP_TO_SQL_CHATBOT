@@ -17,6 +17,7 @@ from typing import List, Dict, Optional
 # Define what type of question user is asking
 class QueryIntent(Enum):
     SQL_QUERY = "sql_query"
+    SQL_SPATIAL = "sql_spatial"          # NEW: spatial/geo queries with geometry
     CASUAL_CHAT = "casual_chat"
     GENERAL_KNOWLEDGE = "general_knowledge"
     SARCASTIC_RESPONSE = "sarcastic_response"
@@ -236,14 +237,20 @@ class QueryEngine:
             {db_domain_desc}
 
             INTENT CATEGORIES (CHOOSE EXACTLY ONE):
-            1. SQL_QUERY - Questions related to the database tables and data mentioned above
-            2. CASUAL_CHAT - Greetings, small talk: "Hi", "How are you?", "Tell me a joke?"
-            3. GENERAL_KNOWLEDGE - Unrelated to database: "Who is PM of India?", "What is AI?", "Explain photosynthesis"
-            4. SARCASTIC_RESPONSE - Troll, nonsense questions not related to our database
-            5. AMBIGUOUS - Not clear enough: "Show me the thing", "Give me the list"
+            1. SQL_QUERY - Questions about database tables and data (no map/location/geometry involved)
+            2. SQL_SPATIAL - Questions involving location, geometry, maps, coordinates, spatial relationships.
+               Examples: "farms near this point", "inside this polygon", "intersects with this shape",
+               "within 10km", "farms that touch this boundary", any question that comes with GeoJSON/geometry data.
+            3. CASUAL_CHAT - Greetings, small talk: "Hi", "How are you?", "Tell me a joke?"
+            4. GENERAL_KNOWLEDGE - Unrelated to database: "Who is PM of India?", "What is AI?", "Explain photosynthesis"
+            5. SARCASTIC_RESPONSE - Troll, nonsense questions not related to our database
+            6. AMBIGUOUS - Not clear enough: "Show me the thing", "Give me the list"
 
-            OUTPUT RULE: Return ONLY ONE word: SQL_QUERY, CASUAL_CHAT, GENERAL_KNOWLEDGE, SARCASTIC_RESPONSE, or AMBIGUOUS
+            OUTPUT RULE: Return ONLY ONE word: SQL_QUERY, SQL_SPATIAL, CASUAL_CHAT, GENERAL_KNOWLEDGE, SARCASTIC_RESPONSE, or AMBIGUOUS
             No explanation. No extra words.
+
+            IMPORTANT: If the user's question contains any GeoJSON geometry, spatial words (near, within, inside,
+            intersects, buffer, radius, polygon, point, coordinates), classify it as SQL_SPATIAL.
 
             Conversation context: {{conversation_context}}"""),
             MessagesPlaceholder(variable_name="chat_history", optional=True),
@@ -438,7 +445,10 @@ Return format: ["TableName1", "TableName2"]"""),
             intent_str = intent_response_obj.content.strip().upper()
             print(f"Intent classification: {intent_str}")
             
-            if "SQL_QUERY" in intent_str:
+            # Check SQL_SPATIAL BEFORE SQL_QUERY (since SQL_SPATIAL contains "SQL")
+            if "SQL_SPATIAL" in intent_str:
+                return QueryIntent.SQL_SPATIAL, token_usage
+            elif "SQL_QUERY" in intent_str:
                 return QueryIntent.SQL_QUERY, token_usage
             elif "CASUAL_CHAT" in intent_str:
                 return QueryIntent.CASUAL_CHAT, token_usage
@@ -668,7 +678,7 @@ Return format: ["TableName1", "TableName2"]"""),
             
             return fallback_tables
     
-    def generate_query(self, question: str, selected_tables: list = None, filtered_schema: str = None, geometry: dict = None):
+    def generate_query(self, question: str, selected_tables: list = None, filtered_schema: str = None, geometry: Optional[dict] = None):
         """Generate SQL query with conversation context. If geometry is provided, PostGIS SQL is generated."""
         import json as _json
         context = self.memory.get_context_summary()
@@ -799,28 +809,131 @@ Return format: ["TableName1", "TableName2"]"""),
 
         return self.validate_and_fix_sql(final_sql, filtered_schema), selected_tables, filtered_schema, token_usage
     
-    def process_query(self, question: str):
-        """Main function: process query with conversation memory"""
+    def _build_spatial_sql(self, raw_sql: str, geometry: dict) -> str:
+        """Post-process spatial SQL: replace __GEOJSON__ placeholder, clean and format."""
+        import re as _re
+        import json as _json
+
+        sql = raw_sql
+
+        # Replace __GEOJSON__ placeholder with Dollar-Quoted real GeoJSON
+        if geometry and '__GEOJSON__' in sql:
+            real_json = _json.dumps(geometry)  # always valid JSON, double quotes
+            sql = sql.replace("'__GEOJSON__'", f"$${real_json}$$")
+            sql = sql.replace('"__GEOJSON__"', f"$${real_json}$$")
+            sql = sql.replace('__GEOJSON__', f"$${real_json}$$")  # fallback
+            print("[GEO] Replaced __GEOJSON__ placeholder with Dollar Quoted JSON")
+
+        # Restore any erroneously escaped double quotes
+        sql = sql.replace('\\"', '"')
+
+        # Single-line format
+        sql = sql.strip()
+        sql = _re.sub(r'\s+', ' ', sql)
+        if not sql.endswith(';'):
+            sql = sql + ';'
+        return sql
+
+    def process_query(self, question: str, geometry: dict = None):
+        """Main function: process query with conversation memory.
+        
+        Args:
+            question: Natural language question from the user.
+            geometry: Optional GeoJSON geometry dict (Point, Polygon, etc.).
+                      If provided, the pipeline automatically routes to SQL_SPATIAL.
+        """
         try:
             # Add user question to memory
             self.memory.add_message("user", question)
-            
-            # Classify intent
-            intent, intent_tokens = self.classify_intent(question)
-            print(f"Detected intent: {intent.value}")
-            
+
+            # If geometry is explicitly provided, skip LLM intent check and go spatial directly
+            if geometry:
+                intent = QueryIntent.SQL_SPATIAL
+                intent_tokens = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                print("[SPATIAL] Geometry provided — forcing SQL_SPATIAL intent (skipping LLM intent call)")
+            else:
+                # Classify intent via LLM
+                intent, intent_tokens = self.classify_intent(question)
+                print(f"Detected intent: {intent.value}")
+
             response_data = None
             total_tokens_used = intent_tokens.get('total_tokens', 0)
-            
-            # Handle based on intent
-            if intent == QueryIntent.SQL_QUERY:
-                sql_query, selected_tables, filtered_schema, gen_tokens = self.generate_query(question)
-                
-                # Calculate total tokens
+
+            # ── SPATIAL SQL BRANCH ────────────────────────────────────────────────────
+            if intent == QueryIntent.SQL_SPATIAL:
+                # generate_query already handles geo_instruction injection + __GEOJSON__ replacement
+                sql_query, selected_tables, filtered_schema, gen_tokens = self.generate_query(
+                    question=question,
+                    geometry=geometry
+                )
+
                 table_tokens = gen_tokens.get('table_selection', {}).get('total_tokens', 0)
                 sql_tokens = gen_tokens.get('sql_generation', {}).get('total_tokens', 0)
                 total_tokens_used += table_tokens + sql_tokens
-                
+
+                # ── SAFETY CHECK: block any non-SELECT spatial query ──────────────────
+                cleaned_upper = sql_query.strip().upper()
+                dangerous_ops = ["UPDATE ", "DELETE ", "INSERT ", "DROP ", "TRUNCATE ", "ALTER ", "CREATE "]
+                if any(cleaned_upper.startswith(d) for d in dangerous_ops):
+                    raise Exception(
+                        "Only SELECT queries are allowed for spatial queries. "
+                        "The AI attempted to generate a write query which has been blocked."
+                    )
+
+                # ── Build clean display version (single quotes for JSON inside SQL) ──
+                import re as _re
+                def _replace_json_quotes(match):
+                    return match.group(0).replace('"', "'")
+                sql_clean = _re.sub(
+                    r'ST_GeomFromGeoJSON\((.*?)\)',
+                    _replace_json_quotes,
+                    sql_query,
+                    flags=_re.IGNORECASE
+                )
+                # Format both to single line
+                def _single_line(q):
+                    q = q.strip()
+                    q = _re.sub(r'\s+', ' ', q)
+                    if not q.endswith(';'): q += ';'
+                    return q
+
+                sql_strict_final = _single_line(sql_query)
+                sql_clean_final  = _single_line(sql_clean)
+
+                response_data = {
+                    "status": "success",
+                    "intent": "sql_spatial",
+                    "question": question,
+                    "geometry_provided": geometry is not None,
+                    "geometry_type": geometry.get("type") if geometry else None,
+                    "sql_query": sql_strict_final,          # executable (pgAdmin)
+                    "sql_query_clean": sql_clean_final,     # display (Swagger)
+                    "sql_query_pgadmin": sql_strict_final,  # alias kept for backward compat
+                    "filtered_tables": selected_tables,
+                    "schema_token_size": len(filtered_schema.split()),
+                    "note": "Use 'sql_query' / 'sql_query_pgadmin' for execution. 'sql_query_clean' is for easy reading.",
+                    "conversation_token_estimate": self.memory.get_token_estimate(),
+                    "llm_token_usage": {
+                        "intent_classification": intent_tokens,
+                        "table_selection": gen_tokens.get('table_selection', {}),
+                        "sql_generation": gen_tokens.get('sql_generation', {}),
+                        "total_tokens_used": total_tokens_used
+                    }
+                }
+
+                self.memory.add_message("assistant", "Generated spatial SQL query", {
+                    "intent": "sql_spatial",
+                    "tables_used": selected_tables
+                })
+
+            # ── STANDARD SQL BRANCH ───────────────────────────────────────────────────
+            elif intent == QueryIntent.SQL_QUERY:
+                sql_query, selected_tables, filtered_schema, gen_tokens = self.generate_query(question)
+
+                table_tokens = gen_tokens.get('table_selection', {}).get('total_tokens', 0)
+                sql_tokens = gen_tokens.get('sql_generation', {}).get('total_tokens', 0)
+                total_tokens_used += table_tokens + sql_tokens
+
                 response_data = {
                     "status": "success",
                     "intent": "sql_query",
@@ -836,13 +949,13 @@ Return format: ["TableName1", "TableName2"]"""),
                         "total_tokens_used": total_tokens_used
                     }
                 }
-                
-                # Add AI response to memory
-                self.memory.add_message("assistant", f"Generated SQL query", {
+
+                self.memory.add_message("assistant", "Generated SQL query", {
                     "intent": "sql_query",
                     "tables_used": selected_tables
                 })
-            
+
+            # ── CASUAL CHAT ───────────────────────────────────────────────────────────
             elif intent == QueryIntent.CASUAL_CHAT:
                 result = self.handle_casual_chat(question)
                 response_data = {
@@ -855,7 +968,8 @@ Return format: ["TableName1", "TableName2"]"""),
                     }
                 }
                 self.memory.add_message("assistant", result["response"], {"intent": "casual_chat"})
-            
+
+            # ── GENERAL KNOWLEDGE ─────────────────────────────────────────────────────
             elif intent == QueryIntent.GENERAL_KNOWLEDGE:
                 result = self.handle_general_knowledge(question)
                 response_data = {
@@ -868,7 +982,8 @@ Return format: ["TableName1", "TableName2"]"""),
                     }
                 }
                 self.memory.add_message("assistant", result["response"], {"intent": "general_knowledge"})
-            
+
+            # ── SARCASTIC ─────────────────────────────────────────────────────────────
             elif intent == QueryIntent.SARCASTIC_RESPONSE:
                 result = self.handle_sarcastic_response(question)
                 response_data = {
@@ -881,15 +996,15 @@ Return format: ["TableName1", "TableName2"]"""),
                     }
                 }
                 self.memory.add_message("assistant", result["response"], {"intent": "sarcastic_response"})
-            
+
+            # ── AMBIGUOUS ─────────────────────────────────────────────────────────────
             else:
-                # Ambiguous - try SQL generation
                 try:
                     sql_query, selected_tables, filtered_schema, gen_tokens = self.generate_query(question)
                     table_tokens = gen_tokens.get('table_selection', {}).get('total_tokens', 0)
                     sql_tokens = gen_tokens.get('sql_generation', {}).get('total_tokens', 0)
                     total_tokens_used += table_tokens + sql_tokens
-                    
+
                     response_data = {
                         "status": "success",
                         "intent": "sql_query",
@@ -908,7 +1023,7 @@ Return format: ["TableName1", "TableName2"]"""),
                         "intent": "ambiguous_sql"
                     })
                 except Exception as e:
-                    response_msg = "Your question is unclear. Please ask about: customers, transactions, insurance, risk profiles, tasks, or employees."
+                    response_msg = "Your question is unclear. Please rephrase your question."
                     response_data = {
                         "status": "error",
                         "intent": "ambiguous",
@@ -920,9 +1035,9 @@ Return format: ["TableName1", "TableName2"]"""),
                         }
                     }
                     self.memory.add_message("assistant", response_msg, {"intent": "ambiguous_error"})
-            
+
             return response_data
-            
+
         except Exception as e:
             raise Exception(f"Query processing failed: {str(e)}")
     

@@ -119,6 +119,18 @@ async def connect_database(
 
 class QueryRequest(BaseModel):
     question: str
+    geometry: Optional[Dict] = None  # Optional GeoJSON geometry (Point, Polygon, etc.) for spatial queries
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "question": "Find farms within 10km of this point",
+                "geometry": {
+                    "type": "Point",
+                    "coordinates": [76.49, 23.25]
+                }
+            }
+        }
 
 class QueryResponse(BaseModel):
     status: str
@@ -169,32 +181,35 @@ async def execute_nlp_query(
     request: QueryRequest,
     current_user: User = Depends(get_current_user)
 ):
-    """Execute NLP query with conversation memory and LLM token tracking"""
+    """
+    Unified NLP query endpoint.
+    - Standard text questions → generates & executes SQL.
+    - Questions with spatial words OR geometry provided → routes to spatial SQL pipeline (SELECT only).
+    """
     try:
-        # Get user's database connection
         print(f"Processing query for user {current_user.id}: {request.question}")
         if current_user.id not in user_db_store:
-            print(f"No database connection found for user {current_user.id}")
             raise HTTPException(
                 status_code=503,
                 detail="No database connected. Please connect to a database first using /database/connect"
             )
-        
+
         user_data = user_db_store[current_user.id]
         query_engine = user_data["query_engine"]
-        
-        result = query_engine.process_query(request.question)
-        
+
+        # Pass geometry (if any) — process_query handles routing internally
+        result = query_engine.process_query(request.question, geometry=request.geometry)
+
+        intent = result.get("intent")
+
         response_data = {
             "status": result.get("status", "success"),
-            "intent": result.get("intent", "unknown"),
+            "intent": intent or "unknown",
             "question": request.question,
             "conversation_token_estimate": result.get("conversation_token_estimate", 0),
             "llm_token_usage": result.get("llm_token_usage", {})
         }
-        
-        intent = result.get("intent")
-        
+
         if intent == "sql_query":
             response_data.update({
                 "sql_query": result.get("sql_query"),
@@ -202,22 +217,36 @@ async def execute_nlp_query(
                 "schema_token_size": result.get("schema_token_size"),
                 "note": result.get("note")
             })
-            
+
+        elif intent == "sql_spatial":
+            # Spatial query: return both versions of the SQL
+            response_data.update({
+                "sql_query": result.get("sql_query"),           # executable (pgAdmin)
+                "filtered_tables": result.get("filtered_tables"),
+                "schema_token_size": result.get("schema_token_size"),
+                "note": result.get("note"),
+                # Extra spatial fields (accessible to clients that know about them)
+                "sql_query_clean": result.get("sql_query_clean"),
+                "sql_query_pgadmin": result.get("sql_query_pgadmin"),
+                "geometry_provided": result.get("geometry_provided"),
+                "geometry_type": result.get("geometry_type"),
+            })
+
         elif intent in ["casual_chat", "sarcastic_response"]:
             response_data.update({
                 "response": result.get("response")
             })
-            
+
         else:
             response_data.update({
                 "response": result.get("response"),
                 "sql_query": result.get("sql_query"),
                 "filtered_tables": result.get("filtered_tables"),
-                "note": "Query intent unclear. Please rephrase."
+                "note": result.get("note", "Query intent unclear. Please rephrase.")
             })
-        
+
         return response_data
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -232,15 +261,16 @@ async def execute_geo_nlp_query(
             "question": "  ",
             "geometry": {
                 "type": "Polygon",
-                "coordinates": [[
-                    
-                ]]
+                "coordinates": [[]]
             }
         }
     ),
     current_user: User = Depends(get_current_user)
 ):
     """
+    [DEPRECATED - use /database/query instead]
+    Backward-compatible alias. Internally calls the unified /query pipeline.
+
     Generate a PostGIS-compatible SQL query from an NLP question + optional GeoJSON geometry.
     The SQL query is returned WITHOUT execution — copy it and run in pgAdmin.
 
@@ -248,7 +278,7 @@ async def execute_geo_nlp_query(
     - ONLY generates SELECT queries (no UPDATE/DELETE/INSERT).
     """
     try:
-        print(f"Geo-query for user {current_user.id}: {request.question}")
+        print(f"[geo-query alias] Routing to unified pipeline for user {current_user.id}")
         if current_user.id not in user_db_store:
             raise HTTPException(
                 status_code=503,
@@ -258,57 +288,21 @@ async def execute_geo_nlp_query(
         user_data = user_db_store[current_user.id]
         qe = user_data["query_engine"]
 
-        # Generate SQL with geometry context (does NOT execute the SQL)
-        sql_query, selected_tables, filtered_schema, token_usage = qe.generate_query(
-            question=request.question,
-            geometry=request.geometry
-        )
+        # Route through the unified process_query with geometry
+        result = qe.process_query(request.question, geometry=request.geometry)
 
-        # Safety check: block any non-SELECT queries
-        cleaned = sql_query.strip().upper()
-        dangerous = ["UPDATE ", "DELETE ", "INSERT ", "DROP ", "TRUNCATE ", "ALTER ", "CREATE "]
-        if any(cleaned.startswith(d) for d in dangerous):
-            raise HTTPException(
-                status_code=400,
-                detail="Only SELECT queries are allowed. The AI attempted to generate a write query which has been blocked."
-            )
-
-        # Prepare two versions of the SQL:
-        # 1. Strict/Valid SQL (for pgAdmin/PostGIS) - Uses Double Quotes (Standard JSON)
-        # 2. Clean/Display SQL (for Swagger UI) - Uses Single Quotes (No Backslashes)
-
-        sql_strict = sql_query.replace('\\"', '"') # Restore double quotes
-
-        # Create Clean Version (Single Quotes)
-        import re
-        def replace_json_quotes(match):
-            return match.group(0).replace('"', "'")
-        
-        # Regex to find JSON content inside ST_GeomFromGeoJSON(...)
-        sql_clean = re.sub(r'ST_GeomFromGeoJSON\((.*?)\)', replace_json_quotes, sql_strict, flags=re.IGNORECASE)
-
-        # Format both to single line
-        def clean_line(q):
-            q = q.strip()
-            q = re.sub(r'\s+', ' ', q)
-            if not q.endswith(';'): q = q + ';'
-            return q
-
-        sql_strict_final = clean_line(sql_strict)
-        sql_clean_final = clean_line(sql_clean)
-
+        # Return in the original geo-query response format for backward compatibility
         return {
-            "status": "success",
+            "status": result.get("status", "success"),
             "question": request.question,
             "geometry_provided": request.geometry is not None,
             "geometry_type": request.geometry.get("type") if request.geometry else None,
-            "sql_query_clean": sql_clean_final,      # For You (Clean Display)
-            "sql_query_pgadmin": sql_strict_final,   # For Database (Strict execution)
-            "filtered_tables": selected_tables,
-            "note": "Use 'sql_query_pgadmin' for execution. 'sql_query_clean' is for easy reading.",
-            "llm_token_usage": token_usage
+            "sql_query_clean": result.get("sql_query_clean"),
+            "sql_query_pgadmin": result.get("sql_query_pgadmin") or result.get("sql_query"),
+            "filtered_tables": result.get("filtered_tables"),
+            "note": "[geo-query is deprecated] Use /database/query with a geometry field instead. " + (result.get("note") or ""),
+            "llm_token_usage": result.get("llm_token_usage")
         }
-
 
     except HTTPException:
         raise
