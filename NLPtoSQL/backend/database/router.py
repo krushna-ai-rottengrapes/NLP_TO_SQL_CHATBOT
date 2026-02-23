@@ -224,10 +224,19 @@ def get_tables_and_views(
             cursor = conn.cursor()
             schema_list = "', '".join(schemas)
             cursor.execute(f"""
+                -- Get regular tables and views
                 SELECT table_schema, table_name, table_type 
                 FROM information_schema.tables 
                 WHERE table_schema IN ('{schema_list}')
-                ORDER BY table_schema, table_name
+                
+                UNION ALL
+                
+                -- Get materialized views
+                SELECT schemaname, matviewname, 'MATERIALIZED VIEW'
+                FROM pg_matviews 
+                WHERE schemaname IN ('{schema_list}')
+                
+                ORDER BY 1, 2
             """)
             results = cursor.fetchall()
             cursor.close()
@@ -239,7 +248,7 @@ def get_tables_and_views(
                     "schema": schema,
                     "name": name,
                     "full_name": f"{schema}.{name}",
-                    "type": "view" if ttype == "VIEW" else "table"
+                    "type": "materialized_view" if ttype == "MATERIALIZED VIEW" else ("view" if ttype == "VIEW" else "table")
                 })
             
             return {

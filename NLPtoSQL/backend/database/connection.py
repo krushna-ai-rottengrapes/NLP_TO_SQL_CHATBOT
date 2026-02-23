@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, Depends, Body
 from langchain_community.utilities.sql_database import SQLDatabase
 from urllib.parse import quote
 from pydantic import BaseModel
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 from Langchain import QueryEngine
 from auth import get_current_user
@@ -119,16 +120,11 @@ async def connect_database(
 
 class QueryRequest(BaseModel):
     question: str
-    geometry: Optional[Dict] = None  # Optional GeoJSON geometry (Point, Polygon, etc.) for spatial queries
 
     class Config:
         json_schema_extra = {
             "example": {
-                "question": "Find farms within 10km of this point",
-                "geometry": {
-                    "type": "Point",
-                    "coordinates": [76.49, 23.25]
-                }
+                "question": "string"
             }
         }
 
@@ -149,6 +145,9 @@ class QueryResponse(BaseModel):
 class GeoQueryRequest(BaseModel):
     question: str
     geometry: Optional[Dict] = None  # GeoJSON geometry (Point, Polygon, etc.)
+    city_name: Optional[str] = None
+    target_table: Optional[str] = None
+    limit: Optional[int] = None
 
     class Config:
         json_schema_extra = {
@@ -169,6 +168,199 @@ class SQLExecuteRequest(BaseModel):
 
 class ConversationHistoryRequest(BaseModel):
     history_data: Dict
+
+
+FORBIDDEN_SQL_PATTERN = re.compile(
+    r"\b(insert|update|delete|drop|alter|truncate|create|grant|revoke|merge|call|execute|replace)\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_city_name_from_question(question: str) -> Optional[str]:
+    """Extract city name from phrases like: '... in Nashik' or 'inside Nashik'."""
+    match = re.search(
+        r"\b(?:in|inside|within)\s+([a-zA-Z][a-zA-Z\s\.'-]{1,80})\??\s*$",
+        question.strip(),
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def _normalize_place_text(value: str) -> str:
+    """Lowercase and remove separators for robust place-name matching."""
+    return re.sub(r"[^a-z0-9]", "", value.lower().strip())
+
+
+def _clean_place_text(value: str) -> str:
+    """Clean user place text for lookup (remove trailing punctuation and farm suffix)."""
+    cleaned = value.strip()
+    cleaned = re.sub(r"[\s\.,;:!?]+$", "", cleaned)
+    cleaned = re.sub(r"'s\s+farm$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+farm$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+(?:falia|village|city|town)$", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+
+def _is_safe_identifier(identifier: str) -> bool:
+    """Allow only simple SQL identifiers for dynamic table/column references."""
+    return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", identifier))
+
+
+def _assert_select_only_sql(sql_query: str):
+    """Block non-SELECT SQL defensively before returning or executing."""
+    cleaned = sql_query.strip()
+
+    # Check for multiple statements
+    if cleaned.count(';') > 1 or (';' in cleaned[:-1]):
+        raise HTTPException(status_code=400, detail="Only one SQL statement is allowed.")
+
+    normalized = cleaned.rstrip(';').strip().lower()
+    
+    # Must start with SELECT or WITH (CTE)
+    if not (normalized.startswith("select") or normalized.startswith("with")):
+        raise HTTPException(status_code=400, detail="Only SELECT queries are allowed.")
+
+    # Block forbidden SQL keywords (DELETE, UPDATE, INSERT, DROP, ALTER, TRUNCATE, etc.)
+    if FORBIDDEN_SQL_PATTERN.search(normalized):
+        raise HTTPException(status_code=400, detail="Non-SELECT operations are blocked.")
+    
+    # Extra strict: block EXEC, EXECUTE, CALL, SYSTEM, SHELL, etc.
+    blocked_keywords = r"\b(exec|execute|call|system|shell|os\.system|subprocess|import|open|__import__|eval)\b"
+    if re.search(blocked_keywords, normalized, re.IGNORECASE):
+        raise HTTPException(status_code=400, detail="Dangerous SQL keywords detected.")
+
+
+def _resolve_city_geometry_from_db(db_instance: SQLDatabase, city_name: str) -> Dict:
+    """
+    Dynamically resolve city geometry from ANY database.
+    Works with ANY table that has:
+    - A geometry column (POLYGON, MULTIPOLYGON, GEOMETRY)
+    - A text column with place names (any name: city, village, falia, district, area, etc.)
+    No hardcoding - pure schema-driven approach.
+    """
+    city_name = _clean_place_text(city_name)
+    print(f"[GEO DYNAMIC] Searching for '{city_name}' in any table with geometry...")
+    
+    # Query geometry_columns (PostGIS standard view)
+    metadata_query = text("""
+        SELECT c.table_schema, c.table_name, c.column_name
+        FROM information_schema.columns c
+        WHERE c.table_schema NOT IN ('information_schema', 'pg_catalog')
+          AND (
+            c.udt_name IN ('geometry', 'geography')
+            OR (c.data_type = 'USER-DEFINED' AND c.udt_name ILIKE '%geom%')
+          )
+        ORDER BY c.table_schema, c.table_name
+    """)
+
+    with db_instance._engine.connect() as conn:
+        geometry_columns = conn.execute(metadata_query).fetchall()
+
+    if not geometry_columns:
+        print(f"[GEO DYNAMIC] ✗ No geometry columns found!")
+        raise HTTPException(status_code=400, detail="No geometry columns found in database.")
+    
+    print(f"[GEO DYNAMIC] Found {len(geometry_columns)} geometry table(s)")
+    normalized_city_name = _normalize_place_text(city_name)
+
+    # Try each geometry table
+    with db_instance._engine.connect() as conn:
+        for schema_name, table_name, geom_col in geometry_columns:
+            if not all(_is_safe_identifier(x) for x in [schema_name, table_name, geom_col]):
+                print(f"[GEO DYNAMIC] Skipping {schema_name}.{table_name}.{geom_col} - unsafe identifier")
+                continue
+
+            # Get ALL text/char columns in this table (not just candidates)
+            column_query = text("""
+                SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema = :schema_name 
+                  AND table_name = :table_name
+                  AND data_type IN ('character varying', 'text', 'character', 'varchar')
+                ORDER BY ordinal_position
+            """)
+            
+            text_columns = [
+                row[0] for row in conn.execute(
+                    column_query,
+                    {"schema_name": schema_name, "table_name": table_name}
+                ).fetchall()
+            ]
+
+            if not text_columns:
+                print(f"[GEO DYNAMIC] Table {schema_name}.{table_name}: No text columns found, skipping")
+                continue
+
+            print(f"[GEO DYNAMIC] Table {schema_name}.{table_name}: Testing {len(text_columns)} text column(s): {text_columns}")
+
+            # Try EACH text column in this table
+            for name_col in text_columns:
+                if not _is_safe_identifier(name_col):
+                    continue
+
+                print(f"[GEO DYNAMIC]   Trying column '{name_col}'...")
+
+                # Method 1: Direct single-row lookup
+                lookup_sql = text(
+                    f'SELECT ST_AsGeoJSON("{geom_col}") AS city_geojson '
+                    f'FROM "{schema_name}"."{table_name}" '
+                    f'WHERE '
+                    f'LOWER(TRIM(CAST("{name_col}" AS TEXT))) = LOWER(TRIM(:city_name)) '
+                    f"OR LOWER(REGEXP_REPLACE(TRIM(CAST(\"{name_col}\" AS TEXT)), '[^a-zA-Z0-9]', '', 'g')) = :normalized_city_name "
+                    f'OR LOWER(CAST("{name_col}" AS TEXT)) ILIKE :city_like '
+                    f'LIMIT 1'
+                )
+
+                try:
+                    result = conn.execute(
+                        lookup_sql,
+                        {
+                            "city_name": city_name,
+                            "normalized_city_name": normalized_city_name,
+                            "city_like": f"%{city_name.strip()}%",
+                        }
+                    ).fetchone()
+
+                    if result and result[0]:
+                        print(f"[GEO DYNAMIC] ✓ Found in {schema_name}.{table_name}.{name_col}!")
+                        return json.loads(result[0])
+                except Exception as e:
+                    print(f"[GEO DYNAMIC]     Direct lookup failed: {str(e)[:100]}")
+                    continue
+
+                # Method 2: Aggregate all matching rows (for multi-row place data)
+                aggregate_sql = text(
+                    f'SELECT ST_AsGeoJSON(ST_UnaryUnion("{geom_col}")) AS city_geojson '
+                    f'FROM "{schema_name}"."{table_name}" '
+                    f'WHERE ('
+                    f'LOWER(TRIM(CAST("{name_col}" AS TEXT))) = LOWER(TRIM(:city_name)) '
+                    f"OR LOWER(REGEXP_REPLACE(TRIM(CAST(\"{name_col}\" AS TEXT)), '[^a-zA-Z0-9]', '', 'g')) = :normalized_city_name "
+                    f'OR LOWER(CAST("{name_col}" AS TEXT)) ILIKE :city_like) '
+                    f'AND "{geom_col}" IS NOT NULL'
+                )
+
+                try:
+                    agg_result = conn.execute(
+                        aggregate_sql,
+                        {
+                            "city_name": city_name,
+                            "normalized_city_name": normalized_city_name,
+                            "city_like": f"%{city_name.strip()}%",
+                        }
+                    ).fetchone()
+
+                    if agg_result and agg_result[0]:
+                        geometry = json.loads(agg_result[0])
+                        if geometry.get("type") in {"Polygon", "MultiPolygon"}:
+                            print(f"[GEO DYNAMIC] ✓ Found aggregated in {schema_name}.{table_name}.{name_col}!")
+                            return geometry
+                except Exception as e:
+                    print(f"[GEO DYNAMIC]     Aggregate lookup failed: {str(e)[:100]}")
+
+    print(f"[GEO DYNAMIC] ✗ No match found in any table/column combination")
+    raise HTTPException(status_code=404, detail=f"Geometry not found for '{city_name}' in any table.")
 
 
 def initialize_db_connection():
@@ -197,8 +389,8 @@ async def execute_nlp_query(
         user_data = user_db_store[current_user.id]
         query_engine = user_data["query_engine"]
 
-        # Pass geometry (if any) — process_query handles routing internally
-        result = query_engine.process_query(request.question, geometry=request.geometry)
+        # /query no longer takes geometry, it is purely string-based
+        result = query_engine.process_query(request.question)
 
         intent = result.get("intent")
 
@@ -288,15 +480,34 @@ async def execute_geo_nlp_query(
         user_data = user_db_store[current_user.id]
         qe = user_data["query_engine"]
 
+        geometry_payload = request.geometry
+
+        # Sir task: if geometry is not provided, resolve city boundary geometry from DB using question text
+        if geometry_payload is None:
+            city_name = request.city_name or _extract_city_name_from_question(request.question)
+            if not city_name:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Geometry missing. Please provide geometry, or send city_name, or ask like '... in <city_name>'."
+                )
+
+            db_instance = user_data["db_instance"]
+            geometry_payload = _resolve_city_geometry_from_db(db_instance, city_name)
+
         # Route through the unified process_query with geometry
-        result = qe.process_query(request.question, geometry=request.geometry)
+        result = qe.process_query(request.question, geometry=geometry_payload)
+
+        # Extra guard: never return non-select SQL from geo endpoint
+        generated_sql = result.get("sql_query_pgadmin") or result.get("sql_query")
+        if generated_sql:
+            _assert_select_only_sql(generated_sql)
 
         # Return in the original geo-query response format for backward compatibility
         return {
             "status": result.get("status", "success"),
             "question": request.question,
-            "geometry_provided": request.geometry is not None,
-            "geometry_type": request.geometry.get("type") if request.geometry else None,
+            "geometry_provided": geometry_payload is not None,
+            "geometry_type": geometry_payload.get("type") if geometry_payload else None,
             "sql_query_clean": result.get("sql_query_clean"),
             "sql_query_pgadmin": result.get("sql_query_pgadmin") or result.get("sql_query"),
             "filtered_tables": result.get("filtered_tables"),
@@ -771,3 +982,87 @@ async def get_system_stats():
         }
     except Exception as e:
         return {"status": "error", "error": str(e)}
+@router.post("/test-geo-resolver")
+async def test_geo_resolver_endpoint(request: dict):
+    """
+    **TEMPORARY DEBUG ENDPOINT** - Test the geometry resolver directly.
+    NO AUTHENTICATION REQUIRED for debugging purposes.
+    
+    Expected request body:
+    {
+        "question": "show records inside Nadipura",
+        "database_id": 1
+    }
+    """
+    try:
+        question = request.get("question", "")
+        database_id = request.get("database_id")
+        
+        if not database_id:
+            return {
+                "status": "error",
+                "message": "database_id required"
+            }
+        
+        # Get database config from DB (bypassing auth for this test endpoint)
+        from db_config import SessionLocal
+        db_session = SessionLocal()
+        try:
+            db_record = db_session.query(DBModel).filter_by(id=database_id).first()
+            if not db_record:
+                return {
+                    "status": "error",
+                    "message": f"Database ID {database_id} not found"
+                }
+            
+            # Decrypt and create connection
+            plain_password = decrypt_password(db_record.password)
+            connection_uri = create_connection_uri(db_record, plain_password)
+            
+            try:
+                db_instance = SQLDatabase.from_uri(connection_uri)
+                print(f"[TEST ENDPOINT] Connected to database: {db_record.db_name}")
+            except Exception as e:
+                return {
+                    "status": "error",
+                    "message": f"Failed to connect to database: {str(e)}"
+                }
+            
+            # Extract city name from question
+            extracted_city = _extract_city_name_from_question(question)
+            print(f"[TEST ENDPOINT] Extracted city: '{extracted_city}'")
+            
+            if not extracted_city:
+                return {
+                    "status": "error",
+                    "message": "Could not extract city/place name from question",
+                    "question": question
+                }
+            
+            # Try to resolve geometry
+            try:
+                geometry = _resolve_city_geometry_from_db(db_instance, extracted_city)
+                return {
+                    "status": "success",
+                    "message": "Geometry resolved successfully",
+                    "city": extracted_city,
+                    "geometry_type": geometry.get("type"),
+                    "geometry": geometry
+                }
+            except HTTPException as e:
+                return {
+                    "status": "error",
+                    "message": e.detail,
+                    "city": extracted_city,
+                    "status_code": e.status_code
+                }
+        finally:
+            db_session.close()
+    
+    except Exception as e:
+        import traceback
+        return {
+            "status": "error",
+            "message": str(e),
+            "traceback": traceback.format_exc()
+        }

@@ -56,6 +56,12 @@ export default function ConnectionsPage() {
     }
   }, [isSuperuser]);
 
+  useEffect(() => {
+    if (showModal && isSuperuser) {
+      fetchClients();
+    }
+  }, [showModal, isSuperuser]);
+
   const fetchConnections = async () => {
     try {
       const res = await api.get("/databases");
@@ -68,7 +74,23 @@ export default function ConnectionsPage() {
   const fetchClients = async () => {
     try {
       const res = await api.get("/clients");
-      setClients(res.data);
+      const data = res.data;
+      const clientList = Array.isArray(data)
+        ? data
+        : Array.isArray(data?.clients)
+        ? data.clients
+        : Array.isArray(data?.data)
+        ? data.data
+        : Array.isArray(data?.results)
+        ? data.results
+        : Array.isArray(data?.items)
+        ? data.items
+        : [];
+      setClients(clientList);
+      if (!selectedClient && clientList.length === 1) {
+        const onlyId = clientList[0]?.id ?? clientList[0]?.client_id;
+        setSelectedClient(onlyId ? String(onlyId) : null);
+      }
     } catch (err) {
       console.error("Failed to fetch clients:", err);
     }
@@ -910,7 +932,7 @@ export default function ConnectionsPage() {
                     <select
                       value={selectedClient || ""}
                       onChange={(e) =>
-                        setSelectedClient(parseInt(e.target.value))
+                        setSelectedClient(e.target.value || null)
                       }
                       className={`w-full rounded-lg border px-3 py-2 ${
                         isDark
@@ -920,11 +942,16 @@ export default function ConnectionsPage() {
                       required
                     >
                       <option value="">Choose a client</option>
-                      {clients.map((client) => (
-                        <option key={client.id} value={client.id}>
-                          {client.client_name}
-                        </option>
-                      ))}
+                      {clients.map((client) => {
+                        const id = client.id ?? client.client_id;
+                        const label =
+                          client.client_name ?? client.name ?? client.email ?? "Client";
+                        return (
+                          <option key={id} value={String(id)}>
+                            {label}
+                          </option>
+                        );
+                      })}
                     </select>
                   </div>
                 )}

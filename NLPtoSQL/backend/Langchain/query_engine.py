@@ -5,7 +5,6 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_community.utilities.sql_database import SQLDatabase
 from langchain_community.tools import DuckDuckGoSearchRun
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-import pandas as pd
 import json
 import os
 import re
@@ -150,15 +149,9 @@ class QueryEngine:
                 AND table_schema = 'public'
                 ORDER BY table_name, column_name
             """
-            result = self.db._engine.execute(query) if hasattr(self.db, '_engine') else None
-            
-            # Try using SQLAlchemy connection directly
-            if result is None:
-                from sqlalchemy import text
-                with self.db._engine.connect() as conn:
-                    rows = conn.execute(text(query)).fetchall()
-            else:
-                rows = result.fetchall()
+            from sqlalchemy import text
+            with self.db._engine.connect() as conn:
+                rows = conn.execute(text(query)).fetchall()
 
             if not rows:
                 return "No geometry columns found in this database."
@@ -571,13 +564,14 @@ Return format: ["TableName1", "TableName2"]"""),
         try:
             all_tables = self.db.get_usable_table_names()
             matched_tables = []
+            normalized_selected = {t.split('.')[-1].lower() for t in self.selected_tables} if self.selected_tables else set()
             
             for actual_table in all_tables:
                 for req_name in table_names:
                     if (req_name.lower() in actual_table.lower() or 
                         actual_table.lower() in req_name.lower()):
                         # If selected_tables is set, only include if in selected_tables
-                        if not self.selected_tables or actual_table in self.selected_tables:
+                        if not self.selected_tables or actual_table.lower() in normalized_selected:
                             matched_tables.append(actual_table)
                             print(f"Matched table: {req_name} -> {actual_table}")
                         break
@@ -593,16 +587,32 @@ Return format: ["TableName1", "TableName2"]"""),
     def _get_schema_for_tables(self, tables: list) -> str:
         """Helper to get schema for specific tables"""
         try:
+            all_tables = set(self.db.get_usable_table_names())
+            normalized_tables = []
+            for table in tables:
+                table_name = table.split('.')[-1]
+                if table_name in all_tables:
+                    normalized_tables.append(table_name)
+
+            normalized_tables = list(dict.fromkeys(normalized_tables))
+            if not normalized_tables:
+                return "Schema unavailable for requested tables"
+
             filtered_db = SQLDatabase.from_uri(
                 self.db._engine.url,
-                sample_rows_in_table_info=1,
-                include_tables=tables,
+                sample_rows_in_table_info=0,
+                include_tables=normalized_tables,
                 engine_args={"pool_pre_ping": True, "pool_recycle": 300}
             )
             return filtered_db.table_info
         except Exception as e:
             print(f"Failed to get schema for tables {tables}: {e}")
-            return self.db.table_info
+            try:
+                fallback_tables = [t.split('.')[-1] for t in tables]
+                fallback_tables = list(dict.fromkeys(fallback_tables))
+                return self.db.get_table_info(table_names=fallback_tables)
+            except Exception:
+                return "Schema unavailable for requested tables"
     
     def validate_and_fix_sql(self, sql_query: str, schema: str = "") -> str:
         """Validate and fix SQL query"""
@@ -646,6 +656,46 @@ Return format: ["TableName1", "TableName2"]"""),
                 sql_query = re.sub(pattern, actual_col, sql_query, flags=re.IGNORECASE)
         
         return sql_query
+
+    def _extract_executable_sql(self, llm_content: str) -> str:
+        """Extract a single executable PostgreSQL SELECT/WITH statement from raw LLM text."""
+        if not llm_content:
+            return ""
+
+        content = llm_content.replace("```sql", "").replace("```", "").strip()
+
+        # Keep only content starting from first SQL keyword
+        start_match = re.search(r"\b(WITH|SELECT)\b", content, flags=re.IGNORECASE)
+        if start_match:
+            content = content[start_match.start():]
+
+        # Remove obvious non-SQL trailers
+        trailer_patterns = [
+            r"\n\s*Note\s*:",
+            r"\n\s*Explanation\s*:",
+            r"\n\s*This query",
+            r"\n\s*The query",
+            r"\n\s*Output",
+        ]
+        for pattern in trailer_patterns:
+            match = re.search(pattern, content, flags=re.IGNORECASE)
+            if match:
+                content = content[:match.start()]
+                break
+
+        # Keep only first SQL statement if multiple are present
+        first_semicolon = content.find(';')
+        if first_semicolon != -1:
+            content = content[:first_semicolon + 1]
+
+        # Normalize whitespace for cleaner pgAdmin execution
+        content = re.sub(r"\s+", " ", content).strip()
+
+        # Ensure terminator
+        if content and not content.endswith(';'):
+            content += ';'
+
+        return content
     
     def parse_table_response(self, response):
         """Extract table names from AI response"""
@@ -719,18 +769,16 @@ Return format: ["TableName1", "TableName2"]"""),
                     f"\n\n[SPATIAL CONTEXT - CRITICAL] The user provided a {geom_type} geometry."
                     f"\n[DB SCHEMA] {geo_schema_info}"
                     f"\nINSTRUCTIONS:"
-                    f"1. Choose function based on query:"
-                    f"   - 'Inside/Within' -> ST_Within"
-                    f"   - 'Buffer/Radius' -> ST_DWithin (meters)"
-                    f"   - 'Intersects' -> ST_Intersects"
+                    f"1. ALWAYS use ST_Intersects for polygon queries (finds overlapping geometries)."
                     f"2. IDENTIFY the correct table & geometry column from schema above."
                     f"3. STRICTLY use the placeholder '__GEOJSON__' inside ST_GeomFromGeoJSON()."
                     f"   - DO NOT write coordinates manually."
                     f"   - DO NOT escape quotes."
                     f"   - JUST write '__GEOJSON__'. Python will replace it."
-                    f"4. ONLY generate a SELECT query."
+                    f"4. MUST use ST_SetSRID with EPSG:4326 (standard lat/lon)."
+                    f"5. ONLY generate a SELECT query."
                     f"\nCORRECT PATTERN:"
-                    f"SELECT * FROM <table_name> WHERE ST_Within(<geom_col>, ST_SetSRID(ST_GeomFromGeoJSON('__GEOJSON__'), 4326));"
+                    f"SELECT * FROM <table_name> WHERE ST_Intersects(<geom_col>, ST_SetSRID(ST_GeomFromGeoJSON('__GEOJSON__'), 4326));"
                 )
 
             question = question + geo_instruction
@@ -778,19 +826,7 @@ Return format: ["TableName1", "TableName2"]"""),
                 "total_tokens": usage.get('total_tokens', 0)
             }
         
-        sql_content = query_response.content.replace("```sql", "").replace("```", "").strip()
-        lines = sql_content.split('\n')
-        sql_lines = []
-        
-        for line in lines:
-            line = line.strip()
-            if (line.startswith('To represent') or line.startswith('You can use') or 
-                line.startswith('Here is') or line.startswith('Note:')):
-                break
-            if line and not line.startswith('#') and not line.startswith('//'):
-                sql_lines.append(line)
-        
-        final_sql = ' '.join(sql_lines).strip()
+        final_sql = self._extract_executable_sql(query_response.content)
 
         # Replace __GEOJSON__ placeholder with the real GeoJSON string
         # This guarantees valid JSON with correct double quotes — no LLM escaping bugs!
